@@ -26,6 +26,10 @@ import optimization
 import tokenization
 import tensorflow as tf
 
+from tensorflow.python.estimator import estimator as estimator_lib
+from tensorflow.contrib.tpu.python.tpu.tpu_estimator import TPUEstimator
+from tensorflow.python.tools import freeze_graph
+
 flags = tf.flags
 
 FLAGS = flags.FLAGS
@@ -75,6 +79,10 @@ flags.DEFINE_bool(
     "do_predict", False,
     "Whether to run the model in inference mode on the test set.")
 
+flags.DEFINE_bool(
+    "do_export", False,
+    "Whether to export the model to frozen graph.")
+
 flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
 
 flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
@@ -108,7 +116,7 @@ tf.flags.DEFINE_string(
 tf.flags.DEFINE_string(
     "tpu_zone", None,
     "[Optional] GCE zone where the Cloud TPU is located in. If not "
-    "specified, we will attempt to automatically detect the GCE project from "
+    "specified, we will attempt to autf.contrib.tpu.TPUEstimatortomatically detect the GCE project from "
     "metadata.")
 
 tf.flags.DEFINE_string(
@@ -123,6 +131,93 @@ flags.DEFINE_integer(
     "num_tpu_cores", 8,
     "Only used if `use_tpu` is True. Total number of TPU cores to use.")
 
+
+class BertTPUEstimator(TPUEstimator):
+  def __init__(self, model_fn=None, model_dir=None, config=None, params=None, use_tpu=True,
+               train_batch_size=None, eval_batch_size=None, predict_batch_size=None,
+               batch_axis=None, eval_on_tpu=True, export_to_tpu=True, warm_start_from=None):
+      super().__init__(model_fn, model_dir, config, params, use_tpu, train_batch_size,
+                       eval_batch_size, predict_batch_size, batch_axis, eval_on_tpu, export_to_tpu,
+                       warm_start_from)
+
+  def predict_with_feeddict(self,
+              input_fn,
+              predict_keys=None,
+              hooks=None,
+              checkpoint_path=None,
+              export_checkpoint_path=None,
+              feed=None):
+    with estimator_lib.context.graph_mode():
+      hooks = estimator_lib._check_hooks_type(hooks)
+      # Check that model has been trained.
+      # Check that model has been trained.
+      if not checkpoint_path:
+        checkpoint_path = estimator_lib.saver.latest_checkpoint(self._model_dir)
+      if not checkpoint_path:
+        estimator_lib.logging.info('Could not find trained model in model_dir: {}, running '
+                     'initialization to predict.'.format(self._model_dir))
+      if export_checkpoint_path:
+        export_checkpoint_path = estimator_lib.saver.latest_checkpoint(export_checkpoint_path)
+
+      with estimator_lib.ops.Graph().as_default() as g:
+        estimator_lib.random_seed.set_random_seed(self._config.tf_random_seed)
+        # self._create_and_assert_global_step(g)
+        features, input_hooks = self._get_features_from_input_fn(
+            input_fn, estimator_lib.model_fn_lib.ModeKeys.PREDICT)
+        estimator_spec = self._call_model_fn(
+            features, None, estimator_lib.model_fn_lib.ModeKeys.PREDICT, self.config)
+
+        # A Hack!
+        feedd = {
+            features['input_ids']: [feed['input_ids']],
+            features['input_mask']: [feed['input_mask']],
+            features['segment_ids']: [feed['segment_ids']]
+        }
+
+        # Call to warm_start has to be after model_fn is called.
+        self._maybe_warm_start(checkpoint_path)
+
+        predictions = self._extract_keys(
+            estimator_spec.predictions, predict_keys)
+        all_hooks = list(input_hooks)
+        all_hooks.extend(hooks)
+        all_hooks.extend(list(estimator_spec.prediction_hooks or []))
+        with estimator_lib.training.MonitoredSession(
+            session_creator=estimator_lib.training.ChiefSessionCreator(
+                checkpoint_filename_with_path=checkpoint_path,
+                master=self._config.master,
+                scaffold=estimator_spec.scaffold,
+                config=self._session_config),
+            hooks=all_hooks) as mon_sess:
+            preds_evaluated = mon_sess.run(predictions, feed_dict=feedd)
+            return preds_evaluated
+            input_graph_name = "input_graph.pb"
+            output_graph_name = "output_graph.pb"
+            export_dir = 'export'
+            tf.train.write_graph(mon_sess.graph, export_dir, input_graph_name)
+            tf.logging.info("Write graph at %s." % os.path.join(export_dir,
+                                                                input_graph_name))
+
+            export_graph = tf.Graph()
+            with export_graph.as_default():
+                freeze_graph.freeze_graph(input_graph=os.path.join(export_dir,
+                                                                   input_graph_name),
+                                          input_saver="",
+                                          input_binary=False,
+                                          input_checkpoint=export_checkpoint_path,
+                                          output_node_names='loss/Softmax',
+                                          restore_op_name="",
+                                          filename_tensor_name="",
+                                          output_graph=os.path.join(export_dir,
+                                                                    output_graph_name),
+                                          clear_devices=True,
+                                          initializer_nodes=None,
+                                          variable_names_blacklist="")
+
+            tf.logging.info("Export model at %s." % os.path.join(export_dir,
+                                                                 output_graph_name))
+
+            return preds_evaluated
 
 class InputExample(object):
   """A single training/test example for simple sequence classification."""
@@ -355,6 +450,47 @@ class ColaProcessor(DataProcessor):
     return examples
 
 
+class SentaProcessor(DataProcessor):
+  """Processor for the Senta data set (GLUE version)."""
+
+  def get_train_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "corpus.train")), "train")
+
+  def get_dev_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "corpus.dev")), "dev")
+
+  def get_test_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "corpus.test")), "test")
+
+  def get_labels(self):
+    """See base class."""
+    return ["0", "1"]
+
+  def _create_examples(self, lines, set_type):
+    """Creates examples for the training and dev sets."""
+    examples = []
+    for (i, line) in enumerate(lines):
+      # Only the test set has a header
+      if set_type == "test" and i == 0:
+        continue
+      guid = "%s-%s" % (set_type, i)
+      if set_type == "test":
+        text_a = tokenization.convert_to_unicode(line[1])
+        label = "0"
+      else:
+        text_a = tokenization.convert_to_unicode(line[1])
+        label = tokenization.convert_to_unicode(line[0])
+      examples.append(
+          InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+    return examples
+
+
 def convert_single_example(ex_index, example, label_list, max_seq_length,
                            tokenizer):
   """Converts a single `InputExample` into a single `InputFeatures`."""
@@ -474,6 +610,19 @@ def file_based_convert_examples_to_features(
     writer.write(tf_example.SerializeToString())
 
 
+def placeholder_based_convert_examples_to_features(
+    examples, label_list, max_seq_length, tokenizer, output_file):
+  """Convert a set of `InputExample`s to a TFRecord file."""
+  features = []
+  for (ex_index, example) in enumerate(examples):
+    if ex_index % 10000 == 0:
+      tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
+
+    feature = convert_single_example(ex_index, example, label_list,
+                                     max_seq_length, tokenizer)
+    features.append(feature.__dict__)
+  return features
+
 def file_based_input_fn_builder(input_file, seq_length, is_training,
                                 drop_remainder):
   """Creates an `input_fn` closure to be passed to TPUEstimator."""
@@ -517,6 +666,31 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
             drop_remainder=drop_remainder))
 
     return d
+
+  return input_fn
+
+def placeholder_input_fn_builder(input_file, seq_length, is_training,
+                                drop_remainder):
+  """Creates an `input_fn` closure to be passed to TPUEstimator."""
+  def input_fn(params):
+    """The actual input function."""
+    batch_size = params["batch_size"]
+
+    # For training, we want a lot of parallel reading and shuffling.
+    # For eval, we want no shuffling and parallel reading doesn't matter.
+    features = {
+        'input_ids': tf.placeholder(tf.int32, shape=[None, seq_length], name="input_ids"),
+        'input_mask': tf.placeholder(tf.int32, shape=[None, seq_length], name="input_mask"),
+        'segment_ids': tf.placeholder(tf.int32, shape=[None, seq_length], name="segment_ids"),
+        'label_ids': tf.placeholder(tf.int32, shape=[None], name="label_ids"),
+    }
+
+    return features, {}
+
+  # predict_input_fn = tf.estimator.inputs.numpy_input_fn({"x": examples},
+  #                                                       batch_size=1,
+  #                                                       num_epochs=1,
+  #                                                       shuffle=False)
 
   return input_fn
 
@@ -742,13 +916,14 @@ def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
   processors = {
+      "senta": SentaProcessor,
       "cola": ColaProcessor,
       "mnli": MnliProcessor,
       "mrpc": MrpcProcessor,
       "xnli": XnliProcessor,
   }
 
-  if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_predict:
+  if not FLAGS.do_train and not FLAGS.do_eval and not FLAGS.do_predict and not FLAGS.do_export:
     raise ValueError(
         "At least one of `do_train`, `do_eval` or `do_predict' must be True.")
 
@@ -811,7 +986,7 @@ def main(_):
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
-  estimator = tf.contrib.tpu.TPUEstimator(
+  estimator = BertTPUEstimator(
       use_tpu=FLAGS.use_tpu,
       model_fn=model_fn,
       config=run_config,
@@ -902,6 +1077,50 @@ def main(_):
             str(class_probability) for class_probability in prediction) + "\n"
         writer.write(output_line)
 
+  if FLAGS.do_export:
+    predict_examples = processor.get_test_examples(FLAGS.data_dir)
+    predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
+    examples = placeholder_based_convert_examples_to_features(predict_examples, label_list,
+                                            FLAGS.max_seq_length, tokenizer,
+                                            predict_file)
+
+
+    tf.logging.info("***** Running prediction*****")
+    tf.logging.info("  Num examples = %d", len(predict_examples))
+    tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
+
+    if FLAGS.use_tpu:
+      # Warning: According to tpu_estimator.py Prediction on TPU is an
+      # experimental feature and hence not supported here
+      raise ValueError("Prediction in TPU not supported")
+
+    predict_drop_remainder = True if FLAGS.use_tpu else False
+    # predict_input_fn = file_based_input_fn_builder(
+    #     input_file=predict_file,
+    #     seq_length=FLAGS.max_seq_length,
+    #     is_training=False,
+    #     drop_remainder=predict_drop_remainder)
+    #
+    predict_input_fn = placeholder_input_fn_builder(
+        input_file=predict_file,
+        seq_length=FLAGS.max_seq_length,
+        is_training=False,
+        drop_remainder=predict_drop_remainder)
+
+    result = estimator.predict_with_feeddict(input_fn=predict_input_fn, feed=examples[0],
+                                             export_checkpoint_path=FLAGS.init_checkpoint)
+
+    tf.logging.info(predict_examples[0].__dict__)
+    tf.logging.info(examples[0])
+    tf.logging.info(result)
+    # output_predict_file = os.path.join(FLAGS.output_dir, "test_results.tsv")
+    # with tf.gfile.GFile(output_predict_file, "w") as writer:
+    #   tf.logging.info("***** Predict results *****")
+    #   for prediction in result:
+    #     output_line = "\t".join(
+    #         str(class_probability) for class_probability in prediction) + "\n"
+    #     writer.write(output_line)
+
 
 if __name__ == "__main__":
   flags.mark_flag_as_required("data_dir")
@@ -910,3 +1129,22 @@ if __name__ == "__main__":
   flags.mark_flag_as_required("bert_config_file")
   flags.mark_flag_as_required("output_dir")
   tf.app.run()
+#
+# # Train.
+# python run_classifier.py \
+#   --task_name=senta \
+#   --do_train=true \
+#   --do_eval=true \
+#   --data_dir=Senta \
+#   --vocab_file=chinese_L-12_H-768_A-12/vocab.txt \
+#   --bert_config_file=chinese_L-12_H-768_A-12/bert_config.json \
+#   --init_checkpoint=chinese_L-12_H-768_A-12/bert_model.ckpt \
+#   --max_seq_length=128 \
+#   --train_batch_size=32 \
+#   --learning_rate=2e-5 \
+#   --num_train_epochs=3.0 \
+#   --output_dir=senta_output/
+#
+#
+# # Export.
+#   python run_classifier.py --task_name=senta --do_export=true --data_dir=Senta --vocab_file=chinese_L-12_H-768_A-12/vocab.txt --bert_config_file=chinese_L-12_H-768_A-12/bert_config.json --init_checkpoint=senta_output/ --max_seq_length=128 --output_dir=senta_eval_output/
