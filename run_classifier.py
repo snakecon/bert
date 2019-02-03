@@ -136,7 +136,7 @@ class BertTPUEstimator(TPUEstimator):
   def __init__(self, model_fn=None, model_dir=None, config=None, params=None, use_tpu=True,
                train_batch_size=None, eval_batch_size=None, predict_batch_size=None,
                batch_axis=None, eval_on_tpu=True, export_to_tpu=True, warm_start_from=None):
-      super().__init__(model_fn, model_dir, config, params, use_tpu, train_batch_size,
+      super(BertTPUEstimator, self).__init__(model_fn, model_dir, config, params, use_tpu, train_batch_size,
                        eval_batch_size, predict_batch_size, batch_axis, eval_on_tpu, export_to_tpu,
                        warm_start_from)
 
@@ -190,7 +190,7 @@ class BertTPUEstimator(TPUEstimator):
                 config=self._session_config),
             hooks=all_hooks) as mon_sess:
             preds_evaluated = mon_sess.run(predictions, feed_dict=feedd)
-            return preds_evaluated
+            # return preds_evaluated
             input_graph_name = "input_graph.pb"
             output_graph_name = "output_graph.pb"
             export_dir = 'export'
@@ -445,6 +445,41 @@ class ColaProcessor(DataProcessor):
       else:
         text_a = tokenization.convert_to_unicode(line[3])
         label = tokenization.convert_to_unicode(line[1])
+      examples.append(
+          InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
+    return examples
+
+
+class CategoryProcessor(DataProcessor):
+  """Processor for the Senta data set (GLUE version)."""
+
+  def get_train_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "corpus.train")), "train")
+
+  def get_dev_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "corpus.dev")), "dev")
+
+  def get_test_examples(self, data_dir):
+    """See base class."""
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "corpus.test")), "test")
+
+  def get_labels(self):
+    """See base class."""
+    return ["0", "1", "2", "3"]
+
+  def _create_examples(self, lines, set_type):
+    """Creates examples for the training and dev sets."""
+    examples = []
+    for (i, line) in enumerate(lines):
+      guid = "%s-%s" % (set_type, i)
+
+      text_a = tokenization.convert_to_unicode(line[1])
+      label = tokenization.convert_to_unicode(line[0])
       examples.append(
           InputExample(guid=guid, text_a=text_a, text_b=None, label=label))
     return examples
@@ -916,6 +951,7 @@ def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
   processors = {
+      "category": CategoryProcessor,
       "senta": SentaProcessor,
       "cola": ColaProcessor,
       "mnli": MnliProcessor,
